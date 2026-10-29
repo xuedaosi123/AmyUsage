@@ -27,7 +27,84 @@ struct Usage {
     }
 }
 
-enum FetchError: Error { case invalidData, unavailable, redirect }
+enum FetchError: Error {
+    case invalidData, unavailable, redirect, missingUsage, managementURL
+    case http(Int, retryAfter: TimeInterval?)
+}
+
+func isManagementURL(_ url: URL) -> Bool {
+    let path = url.path.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    return path == "subscription/index" || path == "clientarea.php"
+}
+
+func retryDelay(_ value: String?, now: Date = Date()) -> TimeInterval? {
+    guard let value else { return nil }
+    if let seconds = Double(value), seconds.isFinite, seconds >= 0 { return seconds }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+    return formatter.date(from: value).map { max(0, $0.timeIntervalSince(now)) }
+}
+
+func errorMessage(_ error: Error) -> String {
+    if let failure = error as? WebsiteError {
+        switch failure {
+        case .loginRequired: return "网页登录已失效。请点击“网页登录/套餐”重新登录。"
+        case .selectPlan: return "请打开“网页登录/套餐”完成登录，程序将自动查找套餐。"
+        case .changedPage: return "网页未显示可识别的流量数据。请打开“网页登录/套餐”检查页面或验证提示。"
+        case .timedOut: return "网站加载超时，请稍后重试，或打开“网页登录/套餐”检查。"
+        case .blockedNavigation: return "网站跳转到非 Amy 官方地址，查询已停止。"
+        }
+    }
+    if let failure = error as? FetchError {
+        switch failure {
+        case .http(403, _): return "服务器拒绝访问（HTTP 403）。请检查网站的订阅获取开关和链接有效性；也可能是服务商的访问策略限制。"
+        case .http(401, _): return "订阅验证失败（HTTP 401）。请检查订阅链接是否仍然有效。"
+        case .http(429, _): return "请求过于频繁（HTTP 429）。已暂停连续请求，请稍后再试。"
+        case .http(404, _): return "订阅地址不存在（HTTP 404）。请检查链接是否已更换。"
+        case .http(let code, _): return "服务器返回 HTTP \(code)，暂时无法获取用量。"
+        case .missingUsage: return "服务器有响应，但没有返回流量信息。请确认填入的是 Clash 订阅链接，服务商也可能未提供用量。"
+        case .invalidData: return "服务器返回的流量数据不完整或格式不正确。"
+        case .redirect: return "订阅跳转到了其他主机或非 HTTPS 地址，查询已停止。请从服务商获取最新订阅链接。"
+        case .managementURL: return "这是网站管理页面。请复制页面中的 Clash 订阅链接。"
+        case .unavailable: return "没有收到有效的服务器响应，请稍后重试。"
+        }
+    }
+    let code = (error as NSError).code
+    if (error as NSError).domain == NSURLErrorDomain {
+        switch code {
+        case NSURLErrorTimedOut: return "连接订阅服务器超时，请检查直连网络后重试。"
+        case NSURLErrorNotConnectedToInternet: return "当前没有网络连接。"
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed: return "无法解析订阅服务器地址。"
+        case NSURLErrorCannotConnectToHost: return "无法连接订阅服务器。"
+        case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateHasUnknownRoot,
+             NSURLErrorServerCertificateNotYetValid: return "订阅服务器的安全连接或证书验证失败。"
+        default: return "网络请求失败（错误码 \(code)），请稍后重试。"
+        }
+    }
+    return "查询失败，请稍后重试。"
+}
+
+struct RefreshGate {
+    var manualAfter = Date.distantPast
+    var automaticAfter = Date.distantPast
+    func remaining(manual: Bool, now: Date = Date()) -> TimeInterval {
+        max(0, (manual ? manualAfter : max(manualAfter, automaticAfter)).timeIntervalSince(now))
+    }
+    mutating func started(now: Date = Date()) { manualAfter = now.addingTimeInterval(30) }
+    mutating func failed(_ error: Error, now: Date = Date()) {
+        var manualDelay: TimeInterval = 60
+        var autoDelay: TimeInterval = 60
+        if case let FetchError.http(code, retryAfter) = error {
+            if code == 403 || code == 401 { autoDelay = 1800 }
+            if let retryAfter { manualDelay = max(60, retryAfter); autoDelay = max(autoDelay, manualDelay) }
+        }
+        manualAfter = now.addingTimeInterval(manualDelay)
+        automaticAfter = now.addingTimeInterval(autoDelay)
+    }
+}
 
 func validURL(_ value: String) -> URL? {
     guard let parts = URLComponents(string: value.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -41,10 +118,10 @@ final class HeaderRequest: NSObject, URLSessionDataDelegate, URLSessionTaskDeleg
     private var callback: ((Result<HTTPURLResponse, Error>) -> Void)?
     private var session: URLSession?
 
-    func run(_ url: URL, method: String) async throws -> HTTPURLResponse {
+    func run(_ url: URL, configuration supplied: URLSessionConfiguration? = nil) async throws -> HTTPURLResponse {
         try await withCheckedThrowingContinuation { continuation in
             callback = { continuation.resume(with: $0) }
-            let configuration = URLSessionConfiguration.ephemeral
+            let configuration = supplied ?? URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 20
             configuration.timeoutIntervalForResource = 25
             configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -56,8 +133,8 @@ final class HeaderRequest: NSObject, URLSessionDataDelegate, URLSessionTaskDeleg
             let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
             self.session = session
             var request = URLRequest(url: url)
-            request.httpMethod = method
-            request.setValue("clash/AmyUsage", forHTTPHeaderField: "User-Agent")
+            request.httpMethod = "GET"
+            request.setValue("Clash", forHTTPHeaderField: "User-Agent")
             request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
             session.dataTask(with: request).resume()
         }
@@ -94,15 +171,14 @@ final class HeaderRequest: NSObject, URLSessionDataDelegate, URLSessionTaskDeleg
     }
 }
 
-func fetchUsage(_ url: URL) async throws -> Usage {
-    for method in ["HEAD", "GET"] {
-        let response = try await HeaderRequest().run(url, method: method)
-        if (200..<300).contains(response.statusCode), let header = response.value(forHTTPHeaderField: "subscription-userinfo") {
-            return try Usage.parse(header)
-        }
-        if method == "GET" { throw FetchError.unavailable }
+func fetchUsage(_ url: URL, configuration: URLSessionConfiguration? = nil) async throws -> Usage {
+    guard !isManagementURL(url) else { throw FetchError.managementURL }
+    let response = try await HeaderRequest().run(url, configuration: configuration)
+    guard (200..<300).contains(response.statusCode) else {
+        throw FetchError.http(response.statusCode, retryAfter: retryDelay(response.value(forHTTPHeaderField: "Retry-After")))
     }
-    throw FetchError.unavailable
+    guard let header = response.value(forHTTPHeaderField: "subscription-userinfo") else { throw FetchError.missingUsage }
+    return try Usage.parse(header)
 }
 
 enum Credential {
@@ -161,7 +237,7 @@ func installApplicationMenu() {
     NSApp.mainMenu = menu
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     let popover = NSPopover()
     let used = NSTextField(labelWithString: "—")
@@ -182,12 +258,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastUpdate: Date?
     var refreshing = false
     var generation = 0
+    var refreshGate = RefreshGate()
+    let website = WebsiteReader()
+    var websiteURL: URL? { UserDefaults.standard.string(forKey: "websitePlan").flatMap(URL.init(string:)).flatMap(planURL) }
+    var usesWebsite: Bool { UserDefaults.standard.bool(forKey: "useWebsite") }
+    let sourceChoice = NSPopUpButton()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         installApplicationMenu()
         UserDefaults.standard.register(defaults: ["refreshMinutes": 30, "showRemaining": false])
         savedURL = Credential.read().flatMap(validURL)
+        website.onSelection = { [weak self] url, usage in
+            guard let self else { return }
+            self.generation += 1
+            UserDefaults.standard.set(url.absoluteString, forKey: "websitePlan")
+            UserDefaults.standard.set(true, forKey: "useWebsite")
+            self.sourceChoice.selectItem(withTag: 1)
+            self.refreshGate = RefreshGate()
+            self.refreshGate.started()
+            self.current = usage
+            self.lastUpdate = Date()
+            self.status.stringValue = "已切换为网站账户查询。"
+            self.configureTimer()
+            self.render()
+        }
+        website.onCleared = { [weak self] in
+            guard let self else { return }
+            self.generation += 1
+            UserDefaults.standard.removeObject(forKey: "websitePlan")
+            self.current = nil
+            self.lastUpdate = nil
+            self.clearDisplayedUsage()
+            self.configureTimer()
+            self.alert("本程序保存的网页登录信息已清除。Safari 的登录状态不受影响。")
+        }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
@@ -195,12 +300,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         createPopover()
         configureTimer()
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
-        if savedURL != nil { refresh() } else { showSettings() }
+        if usesWebsite ? websiteURL != nil : savedURL != nil { refresh() } else { showSettings() }
     }
 
     func createPopover() {
         let controller = NSViewController()
-        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 390))
+        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 470))
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -238,6 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.action = #selector(refreshClicked)
         refreshButton.bezelStyle = .rounded
         stack.addArrangedSubview(refreshButton)
+        stack.addArrangedSubview(NSButton(title: "网页登录/套餐", target: self, action: #selector(showWebsite)))
         let buttons = NSStackView()
         buttons.spacing = 14
         buttons.addArrangedSubview(NSButton(title: "设置", target: self, action: #selector(showSettings)))
@@ -252,7 +358,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown { popover.performClose(nil); return }
         if let button = item.button { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
     }
-    @objc func refreshClicked() { refresh() }
+    @objc func refreshClicked() { refresh(manual: true) }
+    @objc func showWebsite() { popover.performClose(nil); website.showLogin(preferredURL: websiteURL) }
+    @objc func clearWebsite() { website.clearSession() }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func woke() {
         guard UserDefaults.standard.integer(forKey: "refreshMinutes") > 0 else { return }
@@ -260,15 +368,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func configureTimer() {
         timer?.invalidate()
-        guard savedURL != nil else { return }
+        guard usesWebsite ? websiteURL != nil : savedURL != nil else { return }
         let minutes = UserDefaults.standard.integer(forKey: "refreshMinutes")
         guard minutes > 0 else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: Double(minutes * 60), repeats: true) { [weak self] _ in self?.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: Double(minutes * 60), repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
         timer?.tolerance = 30
     }
-    func refresh() {
+    func refresh(manual: Bool = false) {
         guard !refreshing else { return }
-        guard let url = savedURL else { showSettings(); return }
+        let fromWebsite = usesWebsite
+        guard let url = fromWebsite ? websiteURL : savedURL else {
+            if fromWebsite { showWebsite() } else { showSettings() }
+            return
+        }
+        let wait = refreshGate.remaining(manual: manual)
+        if wait > 0 {
+            if manual { alert("为避免连续请求，请在 \(Int(ceil(wait))) 秒后再刷新。") }
+            return
+        }
+        refreshGate.started()
         refreshing = true
         refreshButton.isEnabled = false
         refreshButton.title = "正在刷新…"
@@ -279,17 +399,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 refreshing = false
                 refreshButton.isEnabled = true
                 refreshButton.title = "立即刷新"
-                if generation != requestGeneration, savedURL != nil { refresh() }
+                if generation != requestGeneration, (usesWebsite ? websiteURL != nil : savedURL != nil) { refresh() }
             }
             do {
-                let value = try await fetchUsage(url)
+                let value: Usage
+                if fromWebsite { value = try await website.fetch(url) }
+                else { value = try await fetchUsage(url) }
                 guard generation == requestGeneration else { return }
                 current = value
                 lastUpdate = Date()
+                refreshGate.automaticAfter = .distantPast
                 render()
             } catch {
                 guard generation == requestGeneration else { return }
-                status.stringValue = "更新失败，已保留上次数据。请检查网络、订阅链接，或稍后重试。"
+                refreshGate.failed(error)
+                status.stringValue = errorMessage(error) + (current == nil ? "" : "\n当前显示上次成功的数据。")
                 if current == nil { updated.stringValue = "尚未成功获取数据" }
                 updateTitle()
             }
@@ -299,7 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let value = current else { return }
         used.stringValue = "已用  \(amount(value.used))"
         remaining.stringValue = value.total == 0 ? "不限量" : amount(value.remaining)
-        total.stringValue = value.total == 0 ? "总额度：不限量" : "总额度  \(amount(value.total))"
+        total.stringValue = (value.total == 0 ? "总额度：不限量" : "总额度  \(amount(value.total))") + (usesWebsite ? " · 网站" : " · 订阅")
         progress.doubleValue = value.total > 0 ? min(100, value.used / value.total * 100) : 0
         if let date = value.expiry { expiry.stringValue = "订阅到期  " + DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .none) }
         else { expiry.stringValue = "" }
@@ -325,8 +449,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings.makeFirstResponder(urlField)
             return
         }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 350), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "Amy 流量设置"
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 470), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Amy 流量设置 · 1.3.0"
         window.isReleasedWhenClosed = false
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -337,7 +461,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 24),
             stack.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor, constant: -24),
             stack.topAnchor.constraint(equalTo: window.contentView!.topAnchor, constant: 24)])
-        stack.addArrangedSubview(NSTextField(labelWithString: "粘贴 Amy 的 Clash 订阅链接"))
+        let sourceRow = NSStackView()
+        sourceRow.spacing = 12
+        sourceRow.addArrangedSubview(NSTextField(labelWithString: "查询方式"))
+        sourceChoice.addItem(withTitle: "网站账户（订阅受限时推荐）")
+        sourceChoice.lastItem?.tag = 1
+        sourceChoice.addItem(withTitle: "订阅链接")
+        sourceChoice.lastItem?.tag = 0
+        sourceChoice.selectItem(withTag: usesWebsite ? 1 : 0)
+        sourceRow.addArrangedSubview(sourceChoice)
+        stack.addArrangedSubview(sourceRow)
+        let webActions = NSStackView(views: [NSButton(title: "网页登录/套餐", target: self, action: #selector(showWebsite)), NSButton(title: "清除网页登录", target: self, action: #selector(clearWebsite))])
+        stack.addArrangedSubview(webActions)
+        stack.addArrangedSubview(NSTextField(labelWithString: "Clash 订阅链接（仅订阅查询需要）"))
         urlField.placeholderString = savedURL == nil ? "https://…" : "已保存；留空保留现有链接"
         urlField.font = .systemFont(ofSize: 13)
         urlField.isEditable = true
@@ -351,7 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputRow.addArrangedSubview(pasteButton)
         stack.addArrangedSubview(inputRow)
         inputRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        let help = NSTextField(wrappingLabelWithString: "链接仅保存在本机钥匙串，直接向订阅服务器查询。\n无需网站密码或浏览器权限，不使用第三方转换服务。")
+        let help = NSTextField(wrappingLabelWithString: "网站模式：只需在程序内登录，即可自动查找套餐并查询。\n多个套餐时选择一次。登录会话保存在本机，与 Safari 独立。")
         help.font = .systemFont(ofSize: 12)
         help.textColor = .secondaryLabelColor
         stack.addArrangedSubview(help)
@@ -403,12 +539,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
     @objc func saveSettings() {
+        let useWeb = sourceChoice.selectedTag() == 1
         let raw = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !raw.isEmpty {
+        if !useWeb && !raw.isEmpty {
             guard let url = validURL(raw) else { alert("请输入有效的 HTTPS 订阅链接。"); return }
+            guard !isManagementURL(url) else { alert(errorMessage(FetchError.managementURL)); return }
             guard Credential.save(url.absoluteString) else { alert("无法保存到本机钥匙串，设置未更改。"); return }
             savedURL = url
             generation += 1
+            refreshGate = RefreshGate()
             current = nil
             lastUpdate = nil
             used.stringValue = "—"
@@ -421,7 +560,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             urlField.stringValue = ""
             urlField.placeholderString = "已保存；留空保留现有链接"
         }
-        guard savedURL != nil else { alert("请先粘贴订阅链接。"); return }
+        if useWeb && websiteURL == nil { showWebsite(); return }
+        guard useWeb || savedURL != nil else { alert("请先粘贴订阅链接。"); return }
+        if useWeb != usesWebsite {
+            generation += 1
+            refreshGate = RefreshGate()
+            current = nil
+            lastUpdate = nil
+            clearDisplayedUsage()
+        }
+        UserDefaults.standard.set(useWeb, forKey: "useWebsite")
         UserDefaults.standard.set(interval.selectedTag(), forKey: "refreshMinutes")
         UserDefaults.standard.set(titleOption.state == .on, forKey: "showRemaining")
         configureTimer()
@@ -433,6 +581,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard Credential.remove() else { alert("无法从钥匙串移除订阅，请重试。"); return }
         generation += 1
         savedURL = nil
+        if usesWebsite { alert("订阅链接已移除，网站账户查询仍可使用。"); return }
+        refreshGate = RefreshGate()
         configureTimer()
         current = nil
         lastUpdate = nil
@@ -445,6 +595,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         progress.doubleValue = 0
         updated.stringValue = "请先添加订阅链接"
         status.stringValue = ""
+        updateTitle()
+    }
+    func clearDisplayedUsage() {
+        used.stringValue = "—"; remaining.stringValue = "—"; total.stringValue = "总额度 —"
+        expiry.stringValue = ""; progress.doubleValue = 0
+        updated.stringValue = "尚未成功获取数据"; status.stringValue = ""
         updateTitle()
     }
 }
@@ -469,8 +625,10 @@ if CommandLine.arguments.contains("--self-test") {
     }
     print("All 15 usage and URL checks passed.")
 } else {
-    let application = NSApplication.shared
-    let delegate = AppDelegate()
-    application.delegate = delegate
-    application.run()
+    MainActor.assumeIsolated {
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        application.run()
+    }
 }
