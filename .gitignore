@@ -1,0 +1,19 @@
+# Build output and Finder metadata
+/dist/
+*.app/
+.DS_Store
+.build/
+DerivedData/
+*.dSYM/
+
+# Local configuration and credentials must never be committed
+.env
+.env.*
+*.local
+*.key
+*.pem
+*.p12
+*.mobileprovision
+subscriptions*.json
+subscriptions*.yaml
+subscriptions*.yml
